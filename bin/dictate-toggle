@@ -1,0 +1,298 @@
+#!/usr/bin/env bash
+set -euo pipefail
+umask 077
+export LC_ALL="${LC_ALL:-C.UTF-8}"
+
+readonly MODEL="${DICTATE_MODEL:-$HOME/.local/share/whisper/models/ggml-large-v3-turbo-q5_0.bin}"
+readonly WHISPER_CLI="${DICTATE_WHISPER_CLI:-$HOME/.local/bin/whisper-cli-vulkan}"
+readonly OVERLAY_CALLER="${DICTATE_OVERLAY_CALLER:-$HOME/.local/bin/dictate-overlay}"
+readonly LANGUAGE="${DICTATE_LANGUAGE:-es}"
+readonly WHISPER_DEVICE="${DICTATE_WHISPER_DEVICE:-0}"
+readonly RUNTIME_DIR="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}"
+readonly STATE_DIR="${DICTATE_STATE_DIR:-$RUNTIME_DIR/dictation}"
+readonly LOG_DIR="${DICTATE_LOG_DIR:-$HOME/.local/state/dictation}"
+readonly LOG_FILE="$LOG_DIR/dictation.log"
+readonly PID_FILE="$STATE_DIR/recording.pid"
+readonly WAV_FILE="$STATE_DIR/recording.wav"
+readonly TXT_FILE="$STATE_DIR/transcript.txt"
+readonly LOCK_DIR="$STATE_DIR/transcription.lock"
+
+mkdir -p "$STATE_DIR" "$LOG_DIR"
+touch "$LOG_FILE"
+
+log() {
+    printf '[%s] %s\n' "$(date '+%F %T')" "$*" >>"$LOG_FILE"
+}
+
+notify() {
+    if ! notify-send "$@" >>"$LOG_FILE" 2>&1; then
+        log "notify-send failed: $*"
+    fi
+}
+
+overlay_state() {
+    local next_state="$1"
+    shift
+    if ! "$OVERLAY_CALLER" "$next_state" "$@" >>"$LOG_FILE" 2>&1; then
+        log "Overlay IPC failed for state '$next_state'"
+        return 1
+    fi
+}
+
+error_notified=0
+active_pid_for_cleanup=""
+lock_owned=0
+
+is_recording_pid() {
+    local pid="$1" cmdline
+    [[ "$pid" =~ ^[0-9]+$ ]] || return 1
+    kill -0 "$pid" 2>/dev/null || return 1
+    [[ -r "/proc/$pid/cmdline" ]] || return 1
+    cmdline=$(tr '\0' ' ' <"/proc/$pid/cmdline")
+    [[ "$cmdline" == *pw-record* ]]
+}
+
+is_live_pid() {
+    local pid="$1" state
+    kill -0 "$pid" 2>/dev/null || return 1
+    state=$(ps -p "$pid" -o stat= 2>/dev/null || true)
+    [[ "$state" != Z* ]]
+}
+
+fail() {
+    local message="$1"
+    error_notified=1
+    log "ERROR: $message"
+    if ! overlay_state error "$message"; then
+        notify -u critical "❌ Dictado" "$message"
+    fi
+    exit 1
+}
+
+cleanup_on_exit() {
+    local rc=$?
+    set +e
+    if (( rc != 0 )); then
+        if [[ -n "$active_pid_for_cleanup" ]] && is_recording_pid "$active_pid_for_cleanup"; then
+            log "Cleaning up recording process $active_pid_for_cleanup after error"
+            kill -INT "$active_pid_for_cleanup" 2>/dev/null || true
+            sleep 1
+            if is_live_pid "$active_pid_for_cleanup"; then
+                kill -KILL "$active_pid_for_cleanup" 2>/dev/null || true
+            fi
+        fi
+        rm -f "$PID_FILE" "$WAV_FILE" "$TXT_FILE"
+        if (( lock_owned )); then
+            rm -rf "$LOCK_DIR"
+        fi
+        if (( error_notified == 0 )); then
+            log "ERROR: dictate-toggle exited with status $rc"
+            if ! overlay_state error "Error de dictado; revisa el log"; then
+                notify -u critical "❌ Dictado" "Ha ocurrido un error; revisa $LOG_FILE"
+            fi
+        fi
+    fi
+}
+trap cleanup_on_exit EXIT
+
+for command_name in pw-record wtype notify-send python3; do
+    command -v "$command_name" >/dev/null 2>&1 || fail "Falta el comando requerido: $command_name"
+done
+[[ -x "$WHISPER_CLI" ]] || fail "No existe el motor Whisper Vulkan: $WHISPER_CLI"
+[[ -r "$MODEL" ]] || fail "No existe el modelo Whisper: $MODEL"
+[[ -d "$RUNTIME_DIR" && -w "$RUNTIME_DIR" ]] || fail "XDG_RUNTIME_DIR no es escribible"
+
+acquire_lock() {
+    if mkdir "$LOCK_DIR" 2>/dev/null; then
+        printf '%s\n' "$$" >"$LOCK_DIR/pid"
+        lock_owned=1
+        return
+    fi
+
+    local owner=""
+    [[ -r "$LOCK_DIR/pid" ]] && owner=$(<"$LOCK_DIR/pid")
+    if [[ -n "$owner" && "$owner" =~ ^[0-9]+$ ]] && ! is_live_pid "$owner"; then
+        log "Removing stale transcription lock owned by $owner"
+        rm -rf "$LOCK_DIR"
+        mkdir "$LOCK_DIR"
+        printf '%s\n' "$$" >"$LOCK_DIR/pid"
+        lock_owned=1
+        return
+    fi
+    fail "Ya hay una transcripción en curso"
+}
+
+start_recording() {
+    rm -f "$WAV_FILE" "$TXT_FILE"
+    log "Starting pw-record: $WAV_FILE"
+    pw-record --rate 16000 --channels 1 --format s16 \
+        --media-category Capture --media-role Communication \
+        "$WAV_FILE" >>/dev/null 2>>"$LOG_FILE" &
+    local pid=$!
+    active_pid_for_cleanup="$pid"
+    printf '%s\n' "$pid" >"$PID_FILE"
+    sleep 0.2
+    if ! is_recording_pid "$pid"; then
+        fail "No se pudo iniciar la grabación; revisa $LOG_FILE"
+    fi
+    active_pid_for_cleanup=""
+    log "Recording started with PID $pid"
+    if ! overlay_state listening; then
+        notify -u normal "🎙 Dictado iniciado" "Pulsa Super+D para terminar"
+    fi
+}
+
+stop_recording() {
+    local pid="$1"
+    active_pid_for_cleanup="$pid"
+    log "Stopping pw-record PID $pid"
+    if ! kill -INT "$pid" 2>/dev/null; then
+        if is_recording_pid "$pid"; then
+            fail "No se pudo detener la grabación"
+        fi
+    fi
+
+    local stopped=0
+    for _ in {1..100}; do
+        if ! is_live_pid "$pid"; then
+            stopped=1
+            break
+        fi
+        sleep 0.1
+    done
+    if (( stopped == 0 )); then
+        log "pw-record did not stop after SIGINT; sending SIGTERM"
+        kill -TERM "$pid" 2>/dev/null || true
+        sleep 1
+    fi
+    if is_live_pid "$pid"; then
+        log "pw-record did not stop after SIGTERM; sending SIGKILL"
+        kill -KILL "$pid" 2>/dev/null || true
+        sleep 0.5
+    fi
+    if is_live_pid "$pid"; then
+        fail "No se pudo cerrar pw-record correctamente"
+    fi
+    active_pid_for_cleanup=""
+    rm -f "$PID_FILE"
+    [[ -s "$WAV_FILE" ]] || fail "La grabación no contiene audio"
+}
+
+audio_has_voice_activity() {
+    local audio_file="$1"
+    python3 - "$audio_file" >/dev/null <<'PY'
+import math
+import struct
+import sys
+import wave
+
+path = sys.argv[1]
+try:
+    with wave.open(path, "rb") as wav:
+        if wav.getnchannels() != 1 or wav.getsampwidth() != 2 or wav.getframerate() != 16000:
+            raise ValueError("unexpected WAV format")
+        samples = struct.unpack("<%dh" % wav.getnframes(), wav.readframes(wav.getnframes()))
+except (OSError, EOFError, ValueError, struct.error, wave.Error):
+    raise SystemExit(1)
+
+frame_size = 320  # 20 ms at 16 kHz
+active_frames = 0
+for offset in range(0, len(samples) - frame_size + 1, frame_size):
+    frame = samples[offset:offset + frame_size]
+    mean = sum(frame) / frame_size
+    centered = [sample - mean for sample in frame]
+    rms = math.sqrt(sum(sample * sample for sample in centered) / frame_size)
+    peak = max(abs(sample) for sample in centered)
+    if rms >= 8.0 and peak >= 32:
+        active_frames += 1
+
+# A few sustained active frames distinguish speech from the microphone floor.
+raise SystemExit(0 if active_frames >= 3 else 1)
+PY
+}
+
+transcribe_and_type() {
+    if ! audio_has_voice_activity "$WAV_FILE"; then
+        log "No voice activity detected; skipping transcription and typing"
+        overlay_state idle || true
+        rm -f "$WAV_FILE" "$TXT_FILE"
+        return 0
+    fi
+    if (( lock_owned == 0 )); then
+        acquire_lock
+    fi
+    if ! overlay_state transcribing; then
+        notify -u normal "⏳ Transcribiendo…" "Whisper local está procesando el audio"
+    fi
+    rm -f "$TXT_FILE"
+    local started ended elapsed_ms text
+    started=$(date +%s%N)
+    log "Starting whisper-cli with language $LANGUAGE"
+    if ! "$WHISPER_CLI" \
+        -m "$MODEL" \
+        -f "$WAV_FILE" \
+        -l "$LANGUAGE" \
+        -dev "$WHISPER_DEVICE" \
+        -nt \
+        -otxt \
+        -of "${TXT_FILE%.txt}" \
+        -np >>"$LOG_FILE" 2>&1; then
+        fail "Whisper no pudo transcribir el audio"
+    fi
+    ended=$(date +%s%N)
+    elapsed_ms=$(( (ended - started) / 1000000 ))
+    log "whisper-cli completed in ${elapsed_ms} ms"
+
+    [[ -s "$TXT_FILE" ]] || fail "Whisper no detectó voz"
+    if ! text=$(python3 - "$TXT_FILE" <<'PY'
+from pathlib import Path
+import sys
+
+text = Path(sys.argv[1]).read_text(encoding="utf-8")
+print(text.strip(), end="")
+PY
+    ); then
+        fail "No se pudo leer la transcripción UTF-8"
+    fi
+    [[ -n "$text" ]] || fail "Whisper devolvió una transcripción vacía"
+
+    log "Typing transcript directly with wtype"
+    if ! printf '%s' "$text" | wtype - >>"$LOG_FILE" 2>&1; then
+        fail "No se pudo escribir la transcripción con wtype"
+    fi
+
+    if ! overlay_state success; then
+        log "Overlay success state could not be displayed"
+    fi
+    rm -f "$WAV_FILE" "$TXT_FILE"
+    rm -rf "$LOCK_DIR"
+    lock_owned=0
+    log "Dictation completed successfully; ${elapsed_ms} ms transcription time"
+}
+
+log "dictate-toggle invoked"
+
+if [[ -d "$LOCK_DIR" ]]; then
+    lock_owner=""
+    [[ -r "$LOCK_DIR/pid" ]] && lock_owner=$(<"$LOCK_DIR/pid")
+    if [[ -n "$lock_owner" && "$lock_owner" =~ ^[0-9]+$ ]] && is_live_pid "$lock_owner"; then
+        fail "Ya hay una transcripción en curso"
+    fi
+    log "Removing stale transcription lock before starting"
+    rm -rf "$LOCK_DIR"
+fi
+
+if [[ -f "$PID_FILE" ]]; then
+    pid=$(<"$PID_FILE")
+    if is_recording_pid "$pid"; then
+        acquire_lock
+        stop_recording "$pid"
+        transcribe_and_type
+    else
+        log "Removing stale PID file: $PID_FILE"
+        rm -f "$PID_FILE" "$WAV_FILE" "$TXT_FILE"
+        fail "El PID de grabación era obsoleto; inténtalo de nuevo"
+    fi
+else
+    start_recording
+fi

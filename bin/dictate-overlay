@@ -1,0 +1,17 @@
+#!/usr/bin/env bash
+set -u
+
+state="${1:-}"
+shift || true
+
+case "$state" in
+    listening|transcribing|success|error|idle) ;;
+    *) exit 64 ;;
+esac
+
+if ! command -v qs >/dev/null 2>&1 || ! command -v timeout >/dev/null 2>&1; then
+    exit 127
+fi
+
+config="${DICTATE_QUICKSHELL_CONFIG:-ii}"
+exec timeout 2s qs -c "$config" ipc call dictationOverlay "$state" "$@"

@@ -1,0 +1,16 @@
+# Local runtime and generated files
+*.wav
+*.txt
+*.log
+.state/
+
+# Local Whisper assets and binaries
+*.bin
+*.gguf
+*.ggml
+whisper-cli*
+
+# Editor and OS files
+.DS_Store
+.idea/
+.vscode/
